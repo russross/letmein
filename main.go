@@ -115,13 +115,11 @@ Use "letmein command -help" for more information about a command.
 	if client != nil && modified {
 		raw, err := json.MarshalIndent(client, "", "    ")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding %s: %v\n", filename, err)
-			os.Exit(1)
+			failf("Error encoding %s: %v\n", filename, err)
 		}
 		raw = append(raw, '\n')
 		if err = ioutil.WriteFile(filename, raw, 0600); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", filename, err)
-			os.Exit(1)
+			failf("Error writing %s: %v\n", filename, err)
 		}
 	}
 }
@@ -145,14 +143,12 @@ func createProfile() *Client {
 		for _, elt := range matches {
 			fmt.Printf("    %s\n", elt)
 		}
-		fmt.Fprintf(os.Stderr, "Cannot create new profile that matches existing profile\n")
-		os.Exit(1)
+		failf("Cannot create new profile that matches existing profile\n")
 	}
 
 	// validate the new profile
 	if err := p.Validate(); err != nil {
-		fmt.Fprintf(os.Stderr, "invalid profile: %v\n", err)
-		os.Exit(1)
+		failf("invalid profile: %v\n", err)
 	}
 
 	p.UUID = newUUID()
@@ -184,18 +180,15 @@ func updateProfile() *Client {
 		for _, elt := range matches {
 			fmt.Printf("    %s\n", elt)
 		}
-		fmt.Fprintf(os.Stderr, "Cannot update profile without a unique match\n")
-		os.Exit(1)
+		failf("Cannot update profile without a unique match\n")
 	}
 	if len(matches) == 0 {
-		fmt.Fprintf(os.Stderr, "No matching profile found\n")
-		os.Exit(1)
+		failf("No matching profile found\n")
 	}
 
 	// validate the new profile
 	if err := p.Validate(); err != nil {
-		fmt.Fprintf(os.Stderr, "invalid profile: %v\n", err)
-		os.Exit(1)
+		failf("invalid profile: %v\n", err)
 	}
 
 	q := matches[0]
@@ -246,12 +239,10 @@ func deleteProfile() *Client {
 		for _, elt := range matches {
 			fmt.Printf("    %s\n", elt)
 		}
-		fmt.Fprintf(os.Stderr, "Cannot delete profile without a unique match\n")
-		os.Exit(1)
+		failf("Cannot delete profile without a unique match\n")
 	}
 	if len(matches) == 0 {
-		fmt.Fprintf(os.Stderr, "No matching profile found\n")
-		os.Exit(1)
+		failf("No matching profile found\n")
 	}
 	q := matches[0]
 	fmt.Printf("profile deleted: %s\n", q)
@@ -402,7 +393,9 @@ func syncProfiles() *Client {
 	var master string
 	registerMasterFlag(&master)
 	server := defaultServer
+	verbose := false
 	flag.StringVar(&server, "server", server, "Server URL")
+	flag.BoolVar(&verbose, "v", verbose, "Dump messages")
 	flag.Parse()
 	master = getAndVerifyMaster(master)
 	client := getClient(now, master)
@@ -420,12 +413,23 @@ func syncProfiles() *Client {
 			req.Profiles = append(req.Profiles, elt)
 		}
 	}
+	if verbose {
+		fmt.Printf("\nRequest:\n")
+		dump(req)
+	}
 	raw, err := json.MarshalIndent(req, "", "    ")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error JSON-encoding request: %v\n", err)
 		os.Exit(1)
 	}
-	resp, err := http.Post(server+"/api/v1noauth/sync", "application/json", bytes.NewReader(raw))
+	r, err := http.NewRequest("POST", server+"/api/v1noauth/sync", bytes.NewReader(raw))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error forming POST request: %v\n", err)
+		os.Exit(1)
+	}
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept", "application/json")
+	resp, err := http.DefaultClient.Do(r)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error sending POST request to server: %v\n", err)
 		os.Exit(1)
@@ -444,6 +448,10 @@ func syncProfiles() *Client {
 	if err = decoder.Decode(updates); err != nil {
 		fmt.Fprintf(os.Stderr, "Error decoding server response JSON: %v\n", err)
 		os.Exit(1)
+	}
+	if verbose {
+		fmt.Printf("\nResponse:\n")
+		dump(updates)
 	}
 
 	// merge the results
@@ -502,4 +510,17 @@ func initProfile() *Client {
 	master = getAndVerifyMaster(master)
 	client := newClient(now, master, name)
 	return client
+}
+
+func failf(f string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, f, args...)
+	os.Exit(1)
+}
+
+func dump(elt interface{}) {
+	raw, err := json.MarshalIndent(elt, "", "    ")
+	if err != nil {
+		panic(err.Error())
+	}
+	fmt.Printf("%s\n", raw)
 }
