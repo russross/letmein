@@ -94,7 +94,7 @@ func main() {
 		modified = true
 	default:
 		fmt.Fprint(os.Stderr, `letmein is a password generator
-		
+
 Usage:
 
         letmein command [arguments]
@@ -102,11 +102,11 @@ Usage:
 The commands are:
 
     init        create a new client instance
-    list		list all matching profiles with passwords
-    create		create a new profile
-    update		update an existing profile
-    delete		delete a profile
-    sync		sync profiles with server
+    list        list all matching profiles with passwords
+    create      create a new profile
+    update      update an existing profile
+    delete      delete a profile
+    sync        sync profiles with server
 
 Use "letmein command -help" for more information about a command.
 `)
