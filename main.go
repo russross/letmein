@@ -2,152 +2,504 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
-	"math/big"
-	"strconv"
-	"strings"
-	"unicode"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
 
-	"github.com/dchest/scrypt"
-	"github.com/russross/envflag"
+	"github.com/howeyc/gopass"
 )
 
-const (
-	minMasterLength   int = 1
-	maxMasterLength       = 128
-	minURLLength          = 0
-	maxURLLength          = 256
-	minUsernameLength     = 0
-	maxUsernameLength     = 256
-	minLength             = 1
-	maxLength             = 32
-	defaultLength         = 16
-	minGeneration         = 0
-	maxGeneration         = 1 << 50
-	minChar               = 32
-	maxChar               = 126
+var filename = filepath.Join(os.Getenv("HOME"), ".letmeinrc")
+var never = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	scryptN int = 16384
-	scryptR     = 8
-	scryptP     = 1
-)
+const defaultServer = "https://letmein-app.appspot.com"
+
+type Client struct {
+	Name     string     `json:"name"`
+	Verify   string     `json:"verify"`
+	Profiles []*Profile `json:"profiles,omitempty"`
+
+	ModifiedAt     *time.Time `json:"modified_at,omitempty"`
+	SyncedAt       *time.Time `json:"synced_at,omitempty"`
+	PreviousSyncAt *time.Time `json:"previous_sync_at,omitempty"`
+
+	Master string `json:"-"`
+}
+
+func (c *Client) Matches(q *Profile) []*Profile {
+	out := []*Profile{}
+	for _, elt := range c.Profiles {
+		if elt.Match(q) {
+			out = append(out, elt)
+		}
+	}
+	return out
+}
+
+// VerifyProfile is a simple profile that generates a verification code for the master password.
+// This can be used to catch typos when entering the master password.
+var VerifyProfile = &Profile{
+	Username:    "verify",
+	URL:         "",
+	Generation:  0,
+	Length:      4,
+	Lower:       true,
+	Upper:       false,
+	Digits:      false,
+	Punctuation: false,
+	Spaces:      false,
+	Include:     "",
+	Exclude:     "",
+}
 
 func main() {
-	var (
-		master              string
-		username, url       string
-		generation          int
-		length              int
-		lower, upper        bool
-		digits, punctuation bool
-		spaces              bool
-		include, exclude    string
-	)
+	// check which subcommand is requested
+	cmd := ""
+	if len(os.Args) >= 2 {
+		cmd = os.Args[1]
+	}
+	var client *Client
+	modified := false
+
+	switch cmd {
+	case "create":
+		os.Args = os.Args[1:]
+		client = createProfile()
+		modified = true
+	case "delete":
+		os.Args = os.Args[1:]
+		client = deleteProfile()
+		modified = true
+	case "list":
+		os.Args = os.Args[1:]
+		client = listProfiles()
+	case "sync":
+		os.Args = os.Args[1:]
+		client = syncProfiles()
+		modified = true
+	case "update":
+		os.Args = os.Args[1:]
+		client = updateProfile()
+		modified = true
+	case "init":
+		os.Args = os.Args[1:]
+		client = initProfile()
+		modified = true
+	default:
+		fmt.Fprint(os.Stderr, `letmein is a password generator
+		
+Usage:
+
+        letmein command [arguments]
+
+The commands are:
+
+    init        create a new client instance
+    list		list all matching profiles with passwords
+    create		create a new profile
+    update		update an existing profile
+    delete		delete a profile
+    sync		sync profiles with server
+
+Use "letmein command -help" for more information about a command.
+`)
+	}
+
+	if client != nil && modified {
+		raw, err := json.MarshalIndent(client, "", "    ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error encoding %s: %v\n", filename, err)
+			os.Exit(1)
+		}
+		raw = append(raw, '\n')
+		if err = ioutil.WriteFile(filename, raw, 0600); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", filename, err)
+			os.Exit(1)
+		}
+	}
+}
+
+func createProfile() *Client {
+	now := time.Now().Round(time.Millisecond)
 
 	// gather options
-	envflag.StringVar(&master, "master", "", "Master password")
-	envflag.StringVar(&username, "username", "", "User name/email")
-	envflag.StringVar(&url, "url", "", "Website URL")
-	envflag.IntVar(&generation, "generation", 0, "Generation counter")
-	envflag.IntVar(&length, "length", defaultLength, "Password length")
-	envflag.BoolVar(&lower, "lower", true, "Include lower-case letters")
-	envflag.BoolVar(&upper, "upper", true, "Include upper-case letters")
-	envflag.BoolVar(&digits, "digits", true, "Include digits")
-	envflag.BoolVar(&punctuation, "punctuation", true, "Include punctuation")
-	envflag.BoolVar(&spaces, "spaces", false, "Include spaces")
-	envflag.StringVar(&include, "include", "", "Include specific ASCII characters")
-	envflag.StringVar(&exclude, "exclude", "", "Exclude specific ASCII characters")
+	var master string
+	registerMasterFlag(&master)
+	p := new(Profile)
+	registerProfileFlags(p)
 	flag.Parse()
+	master = getAndVerifyMaster(master)
+	client := getClient(now, master)
 
-	// validate inputs
+	// see if this profile already exists
+	matches := client.Matches(p)
+	if len(matches) != 0 {
+		fmt.Printf("Profile matches:\n")
+		for _, elt := range matches {
+			fmt.Printf("    %s\n", elt)
+		}
+		fmt.Fprintf(os.Stderr, "Cannot create new profile that matches existing profile\n")
+		os.Exit(1)
+	}
+
+	// validate the new profile
+	if err := p.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid profile: %v\n", err)
+		os.Exit(1)
+	}
+
+	p.UUID = newUUID()
+	p.ModifiedAt = &now
+
+	fmt.Printf("profile created: %s --> %s\n", p, p.Generate(master))
+	client.ModifiedAt = &now
+	client.Profiles = append(client.Profiles, p)
+
+	return client
+}
+
+func updateProfile() *Client {
+	now := time.Now().Round(time.Millisecond)
+
+	// gather options
+	var master string
+	registerMasterFlag(&master)
+	p := new(Profile)
+	registerProfileFlags(p)
+	flag.Parse()
+	master = getAndVerifyMaster(master)
+	client := getClient(now, master)
+
+	// find this profile
+	matches := client.Matches(p)
+	if len(matches) > 1 {
+		fmt.Printf("Profile matches:\n")
+		for _, elt := range matches {
+			fmt.Printf("    %s\n", elt)
+		}
+		fmt.Fprintf(os.Stderr, "Cannot update profile without a unique match\n")
+		os.Exit(1)
+	}
+	if len(matches) == 0 {
+		fmt.Fprintf(os.Stderr, "No matching profile found\n")
+		os.Exit(1)
+	}
+
+	// validate the new profile
+	if err := p.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid profile: %v\n", err)
+		os.Exit(1)
+	}
+
+	q := matches[0]
+	if p.Username != "" {
+		q.Username = p.Username
+	}
+	if p.URL != "" {
+		q.URL = p.URL
+	}
+	if p.Generation != defaultGeneration {
+		q.Generation = p.Generation
+	}
+	if p.Length != defaultLength {
+		q.Length = p.Length
+	}
+	q.Lower = p.Lower
+	q.Upper = p.Upper
+	q.Digits = p.Digits
+	q.Punctuation = p.Punctuation
+	q.Spaces = p.Spaces
+	q.Include = p.Include
+	q.Exclude = p.Exclude
+	q.ModifiedAt = &now
+
+	fmt.Printf("profile updated: %s --> %s\n", q, q.Generate(master))
+	client.ModifiedAt = &now
+
+	return client
+}
+
+func deleteProfile() *Client {
+	now := time.Now().Round(time.Millisecond)
+
+	// gather options
+	var master string
+	registerMasterFlag(&master)
+	p := new(Profile)
+	registerProfileFlags(p)
+	flag.Parse()
+	master = getAndVerifyMaster(master)
+	client := getClient(now, master)
+
+	// find this profile
+	matches := client.Matches(p)
+
+	if len(matches) > 1 {
+		fmt.Printf("Profile matches:\n")
+		for _, elt := range matches {
+			fmt.Printf("    %s\n", elt)
+		}
+		fmt.Fprintf(os.Stderr, "Cannot delete profile without a unique match\n")
+		os.Exit(1)
+	}
+	if len(matches) == 0 {
+		fmt.Fprintf(os.Stderr, "No matching profile found\n")
+		os.Exit(1)
+	}
+	q := matches[0]
+	fmt.Printf("profile deleted: %s\n", q)
+
+	q.Username = ""
+	q.URL = ""
+	q.Generation = 0
+	q.Length = 0
+	q.Lower = false
+	q.Upper = false
+	q.Digits = false
+	q.Punctuation = false
+	q.Spaces = false
+	q.Include = ""
+	q.Exclude = ""
+	q.ModifiedAt = &now
+
+	client.ModifiedAt = &now
+
+	return client
+}
+
+func listProfiles() *Client {
+	now := time.Now().Round(time.Millisecond)
+
+	// gather options
+	var master string
+	registerMasterFlag(&master)
+	p := new(Profile)
+	registerProfileFlags(p)
+	flag.Parse()
+	master = getAndVerifyMaster(master)
+	client := getClient(now, master)
+
+	// find matching profiles
+	matches := client.Matches(p)
+
+	for _, elt := range matches {
+		fmt.Printf("    %s --> %s\n", elt, elt.Generate(master))
+	}
+
+	return client
+}
+
+func registerMasterFlag(master *string) {
+	flag.StringVar(master, "master", "", "Master password (or set LETMEIN_MASTER)")
+}
+
+func getAndVerifyMaster(master string) string {
+	// prompt for a master password if necessary
+	if len(master) == 0 {
+		// get master password from environment, or from keyboard
+		if s := os.Getenv("LETMEIN_MASTER"); s != "" {
+			master = s
+		} else {
+			fmt.Printf("Master password: ")
+			master = string(gopass.GetPasswdMasked())
+			if len(master) == 0 {
+				fmt.Fprintf(os.Stderr, "master password is required")
+				os.Exit(1)
+			}
+		}
+	}
+
+	// validate the master password
 	if len(master) < minMasterLength || len(master) > maxMasterLength {
-		log.Fatalf("master password must be between %d and %d characters", minMasterLength, maxMasterLength)
-	}
-	if len(url) < minURLLength || len(url) > maxURLLength {
-		log.Fatalf("website URL must be between %d and %d characters", minURLLength, maxURLLength)
-	}
-	if len(username) < minUsernameLength || len(username) > maxUsernameLength {
-		log.Fatalf("username must be between %d and %d characters", minUsernameLength, maxUsernameLength)
-	}
-	if length < minLength || length > maxLength {
-		log.Fatalf("length must be between %d and %d", minLength, maxLength)
-	}
-	if generation < minGeneration || generation > maxGeneration {
-		log.Fatalf("generation must be between %d and %d", minGeneration, maxGeneration)
+		fmt.Fprintf(os.Stderr, "master password must be between %d and %d characters\n", minMasterLength, maxMasterLength)
+		os.Exit(1)
 	}
 	for _, r := range master {
 		if r < minChar || r > maxChar {
-			log.Fatalf("master password contains an illegal character")
-		}
-	}
-	for _, r := range username {
-		if r < minChar || r > maxChar {
-			log.Fatalf("username/email contains an illegal character")
-		}
-	}
-	for _, r := range url {
-		if r < minChar || r > maxChar {
-			log.Fatalf("website URL contains an illegal character")
+			fmt.Fprintf(os.Stderr, "master password contains an illegal character\n")
+			os.Exit(1)
 		}
 	}
 
-	// generate the password
-	passwordPart := master + "\t" + url + "\t" + username
-	saltPart := strconv.Itoa(generation)
-	hash, err := scrypt.Key([]byte(passwordPart), []byte(saltPart), scryptN, scryptR, scryptP, length)
+	return master
+}
+
+func registerProfileFlags(p *Profile) {
+	flag.StringVar(&p.Username, "username", "", "User name/email")
+	flag.StringVar(&p.URL, "url", "", "Website URL")
+	flag.IntVar(&p.Generation, "generation", defaultGeneration, "Generation counter")
+	flag.IntVar(&p.Length, "length", defaultLength, "Password length")
+	flag.BoolVar(&p.Lower, "lower", true, "Include lower-case letters")
+	flag.BoolVar(&p.Upper, "upper", true, "Include upper-case letters")
+	flag.BoolVar(&p.Digits, "digits", true, "Include digits")
+	flag.BoolVar(&p.Punctuation, "punctuation", true, "Include punctuation")
+	flag.BoolVar(&p.Spaces, "spaces", false, "Include spaces")
+	flag.StringVar(&p.Include, "include", "", "Include specific ASCII characters")
+	flag.StringVar(&p.Exclude, "exclude", "", "Exclude specific ASCII characters")
+}
+
+func getClient(now time.Time, master string) *Client {
+	// load the file
+	raw, err := ioutil.ReadFile(filename)
+	if err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", filename, err)
+		os.Exit(1)
+	} else if err != nil {
+		// no profile list exists
+		fmt.Fprintf(os.Stderr, "No profile data found: you must run the init function first\n")
+		os.Exit(1)
+	}
+
+	client := new(Client)
+	if err := json.Unmarshal(raw, &client); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing %s: %v\n", filename, err)
+		os.Exit(1)
+	}
+	verify := VerifyProfile.Generate(master)
+	if client.Verify == "" {
+		client.Verify = verify
+		client.ModifiedAt = &now
+	} else if client.Verify != verify {
+		fmt.Fprintf(os.Stderr, "Master password verification mismatch: found %s but expected %s\n", verify, client.Verify)
+		os.Exit(1)
+	}
+
+	return client
+}
+
+func newClient(now time.Time, master string, name string) *Client {
+	// make sure the file does not exist
+	_, err := os.Stat(filename)
+	if err == nil {
+		fmt.Fprintf(os.Stderr, "Profile data already exists; delete %s to reset and start over\n", filename)
+		os.Exit(1)
+	} else if !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Error checking for existing profile data: %v\n", err)
+		os.Exit(1)
+	}
+	client := &Client{
+		Name:     name,
+		Verify:   VerifyProfile.Generate(master),
+		Profiles: []*Profile{},
+
+		Master: master,
+	}
+
+	return client
+}
+
+func syncProfiles() *Client {
+	now := time.Now().Round(time.Millisecond)
+
+	// gather options
+	var master string
+	registerMasterFlag(&master)
+	server := defaultServer
+	flag.StringVar(&server, "server", server, "Server URL")
+	flag.Parse()
+	master = getAndVerifyMaster(master)
+	client := getClient(now, master)
+
+	// prepare the sync request
+	req := &Client{
+		Name:           client.Name,
+		Verify:         client.Verify,
+		ModifiedAt:     client.ModifiedAt,
+		SyncedAt:       &now,
+		PreviousSyncAt: client.PreviousSyncAt,
+	}
+	for _, elt := range client.Profiles {
+		if elt.ModifiedAt != nil {
+			req.Profiles = append(req.Profiles, elt)
+		}
+	}
+	raw, err := json.MarshalIndent(req, "", "    ")
 	if err != nil {
-		log.Fatalf("scrypt error: %v", err)
+		fmt.Fprintf(os.Stderr, "Error JSON-encoding request: %v\n", err)
+		os.Exit(1)
+	}
+	resp, err := http.Post(server+"/api/v1noauth/sync", "application/json", bytes.NewReader(raw))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error sending POST request to server: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "Server returned an error status: %s\n", resp.Status)
+		io.Copy(os.Stderr, resp.Body)
+		fmt.Fprintf(os.Stderr, "\n")
+		os.Exit(1)
 	}
 
-	// generate the character set
-	buf := new(bytes.Buffer)
-	for r := rune(minChar); r <= rune(maxChar); r++ {
-		use := false
+	// decode the response
+	updates := new(Client)
+	decoder := json.NewDecoder(resp.Body)
+	if err = decoder.Decode(updates); err != nil {
+		fmt.Fprintf(os.Stderr, "Error decoding server response JSON: %v\n", err)
+		os.Exit(1)
+	}
 
-		// is this a character the profile calls for?
-		switch {
-		case unicode.IsSpace(r):
-			use = spaces
-		case unicode.IsLower(r):
-			use = lower
-		case unicode.IsUpper(r):
-			use = upper
-		case unicode.IsDigit(r):
-			use = digits
-		default:
-			use = punctuation
+	// merge the results
+	client.ModifiedAt = nil
+	client.SyncedAt = nil
+	client.PreviousSyncAt = updates.PreviousSyncAt
+
+	byuuid := make(map[string]*Profile)
+	for _, elt := range client.Profiles {
+		// discard deleted records now that they hav been uploaded
+		if elt.Length > 0 {
+			byuuid[elt.UUID] = elt
 		}
 
-		// is this a special case?
-		if strings.ContainsRune(include, r) {
-			use = true
-		}
-		if strings.ContainsRune(exclude, r) {
-			use = false
-		}
+		// reset updated fields
+		elt.ModifiedAt = nil
+	}
+	for _, elt := range updates.Profiles {
+		// is it a delete notice?
+		if elt.Length <= 0 {
+			log.Printf("deleting profile: %s", byuuid[elt.UUID])
+			delete(byuuid, elt.UUID)
+		} else {
+			if _, exists := byuuid[elt.UUID]; exists {
+				log.Printf("updating profile: %s", elt)
+			} else {
+				log.Printf("adding profile: %s", elt)
+			}
 
-		if use {
-			buf.WriteRune(r)
+			elt.ModifiedAt = nil
+			byuuid[elt.UUID] = elt
 		}
 	}
-	chars := buf.String()
-
-	// map the generated password to the character set
-	pool := new(big.Int).SetBytes(hash)
-	poolSize := new(big.Int).SetBit(new(big.Int), len(hash)*8, 1)
-
-	out := new(bytes.Buffer)
-	for i := 0; i < length; i++ {
-		// generate one number in the range len(chars)
-		base := new(big.Int).Mul(pool, big.NewInt(int64(len(chars))))
-		quo, rem := new(big.Int).QuoRem(base, poolSize, new(big.Int))
-		pool = rem
-		out.WriteByte(chars[int(quo.Int64())])
+	client.Profiles = []*Profile{}
+	for _, elt := range byuuid {
+		client.Profiles = append(client.Profiles, elt)
 	}
-	password := out.String()
+	return client
+}
 
-	// report the generated password
-	fmt.Printf("%s\n", password)
+func initProfile() *Client {
+	now := time.Now().Round(time.Millisecond)
+
+	// gather options
+	var master string
+	registerMasterFlag(&master)
+	server := "http://letmein-app.appspot.com"
+	name := ""
+	flag.StringVar(&server, "server", server, "Server URL")
+	flag.StringVar(&name, "name", name, "Name to identify your account (required)")
+	flag.Parse()
+	if name == "" {
+		fmt.Fprintf(os.Stderr, "name is required\n")
+		os.Exit(1)
+	}
+	master = getAndVerifyMaster(master)
+	client := newClient(now, master, name)
+	return client
 }
