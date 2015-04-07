@@ -26,17 +26,16 @@ type Client struct {
 	Verify   string     `json:"verify"`
 	Profiles []*Profile `json:"profiles,omitempty"`
 
-	ModifiedAt     *time.Time `json:"modified_at,omitempty"`
 	SyncedAt       *time.Time `json:"synced_at,omitempty"`
 	PreviousSyncAt *time.Time `json:"previous_sync_at,omitempty"`
 
 	Master string `json:"-"`
 }
 
-func (c *Client) Matches(q *Profile) []*Profile {
+func (c *Client) Matches(search string) []*Profile {
 	out := []*Profile{}
 	for _, elt := range c.Profiles {
-		if elt.Match(q) {
+		if elt.Match(search) {
 			out = append(out, elt)
 		}
 	}
@@ -97,7 +96,7 @@ func main() {
 
 Usage:
 
-        letmein command [arguments]
+        letmein command [arguments] <searchterm>
 
 The commands are:
 
@@ -137,8 +136,7 @@ func createProfile() *Client {
 	client := getClient(now, master)
 
 	// see if this profile already exists
-	matches := client.Matches(p)
-	if len(matches) != 0 {
+	if matches := client.Matches(p.Name); len(matches) != 0 {
 		fmt.Printf("Profile matches:\n")
 		for _, elt := range matches {
 			fmt.Printf("    %s\n", elt)
@@ -146,16 +144,16 @@ func createProfile() *Client {
 		failf("Cannot create new profile that matches existing profile\n")
 	}
 
+	p.UUID = newUUID()
+	p.Scheme = schemeScrypt
+	p.ModifiedAt = &now
+
 	// validate the new profile
 	if err := p.Validate(); err != nil {
 		failf("invalid profile: %v\n", err)
 	}
 
-	p.UUID = newUUID()
-	p.ModifiedAt = &now
-
 	fmt.Printf("profile created: %s --> %s\n", p, p.Generate(master))
-	client.ModifiedAt = &now
 	client.Profiles = append(client.Profiles, p)
 
 	return client
@@ -173,8 +171,14 @@ func updateProfile() *Client {
 	master = getAndVerifyMaster(master)
 	client := getClient(now, master)
 
-	// find this profile
-	matches := client.Matches(p)
+	// get search string
+	args := flag.Args()
+	if len(args) != 1 {
+		failf("Must profile exactly one search term to find profile to update\n")
+	}
+
+	// find the matching profile
+	matches := client.Matches(args[0])
 	if len(matches) > 1 {
 		fmt.Printf("Profile matches:\n")
 		for _, elt := range matches {
@@ -186,35 +190,43 @@ func updateProfile() *Client {
 		failf("No matching profile found\n")
 	}
 
-	// validate the new profile
-	if err := p.Validate(); err != nil {
-		failf("invalid profile: %v\n", err)
-	}
-
 	q := matches[0]
-	if p.Username != "" {
-		q.Username = p.Username
-	}
-	if p.URL != "" {
-		q.URL = p.URL
-	}
-	if p.Generation != defaultGeneration {
-		q.Generation = p.Generation
-	}
-	if p.Length != defaultLength {
-		q.Length = p.Length
-	}
-	q.Lower = p.Lower
-	q.Upper = p.Upper
-	q.Digits = p.Digits
-	q.Punctuation = p.Punctuation
-	q.Spaces = p.Spaces
-	q.Include = p.Include
-	q.Exclude = p.Exclude
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "name":
+			q.Name = p.Name
+		case "username":
+			q.Username = p.Username
+		case "url":
+			q.URL = p.URL
+		case "generation":
+			q.Generation = p.Generation
+		case "length":
+			q.Length = p.Length
+		case "lower":
+			q.Lower = p.Lower
+		case "upper":
+			q.Upper = p.Upper
+		case "digits":
+			q.Digits = p.Digits
+		case "punctuation":
+			q.Punctuation = p.Punctuation
+		case "spaces":
+			q.Spaces = p.Spaces
+		case "include":
+			q.Include = p.Include
+		case "exclude":
+			q.Exclude = p.Exclude
+		}
+	})
 	q.ModifiedAt = &now
 
+	// validate the updated profile
+	if err := q.Validate(); err != nil {
+		failf("updated profile is invalid, canceling: %v\n", err)
+	}
+
 	fmt.Printf("profile updated: %s --> %s\n", q, q.Generate(master))
-	client.ModifiedAt = &now
 
 	return client
 }
@@ -231,9 +243,14 @@ func deleteProfile() *Client {
 	master = getAndVerifyMaster(master)
 	client := getClient(now, master)
 
-	// find this profile
-	matches := client.Matches(p)
+	// get search string
+	args := flag.Args()
+	if len(args) != 1 {
+		failf("Must profile exactly one search term to find profile to delete\n")
+	}
 
+	// find the matching profile
+	matches := client.Matches(args[0])
 	if len(matches) > 1 {
 		fmt.Printf("Profile matches:\n")
 		for _, elt := range matches {
@@ -244,23 +261,17 @@ func deleteProfile() *Client {
 	if len(matches) == 0 {
 		failf("No matching profile found\n")
 	}
+
 	q := matches[0]
 	fmt.Printf("profile deleted: %s\n", q)
 
-	q.Username = ""
-	q.URL = ""
-	q.Generation = 0
+	// delete it
 	q.Length = 0
-	q.Lower = false
-	q.Upper = false
-	q.Digits = false
-	q.Punctuation = false
-	q.Spaces = false
-	q.Include = ""
-	q.Exclude = ""
 	q.ModifiedAt = &now
 
-	client.ModifiedAt = &now
+	if err := q.Validate(); err != nil {
+		failf("deleted profile is invalid, canceling: %v\n", err)
+	}
 
 	return client
 }
@@ -277,8 +288,17 @@ func listProfiles() *Client {
 	master = getAndVerifyMaster(master)
 	client := getClient(now, master)
 
+	// get search string
+	args := flag.Args()
+	search := ""
+	if len(args) == 1 {
+		search = args[0]
+	} else if len(args) > 1 {
+		failf("Must provide no more than one search term to find profiles to list\n")
+	}
+
 	// find matching profiles
-	matches := client.Matches(p)
+	matches := client.Matches(search)
 
 	for _, elt := range matches {
 		fmt.Printf("    %s --> %s\n", elt, elt.Generate(master))
@@ -323,6 +343,7 @@ func getAndVerifyMaster(master string) string {
 }
 
 func registerProfileFlags(p *Profile) {
+	flag.StringVar(&p.Name, "name", "", "Profile name")
 	flag.StringVar(&p.Username, "username", "", "User name/email")
 	flag.StringVar(&p.URL, "url", "", "Website URL")
 	flag.IntVar(&p.Generation, "generation", defaultGeneration, "Generation counter")
@@ -356,7 +377,6 @@ func getClient(now time.Time, master string) *Client {
 	verify := VerifyProfile.Generate(master)
 	if client.Verify == "" {
 		client.Verify = verify
-		client.ModifiedAt = &now
 	} else if client.Verify != verify {
 		fmt.Fprintf(os.Stderr, "Master password verification mismatch: found %s but expected %s\n", verify, client.Verify)
 		os.Exit(1)
@@ -404,7 +424,6 @@ func syncProfiles() *Client {
 	req := &Client{
 		Name:           client.Name,
 		Verify:         client.Verify,
-		ModifiedAt:     client.ModifiedAt,
 		SyncedAt:       &now,
 		PreviousSyncAt: client.PreviousSyncAt,
 	}
@@ -455,14 +474,13 @@ func syncProfiles() *Client {
 	}
 
 	// merge the results
-	client.ModifiedAt = nil
 	client.SyncedAt = nil
 	client.PreviousSyncAt = updates.PreviousSyncAt
 
 	byuuid := make(map[string]*Profile)
 	for _, elt := range client.Profiles {
 		// discard deleted records now that they hav been uploaded
-		if elt.Length > 0 {
+		if !elt.IsDeleted() {
 			byuuid[elt.UUID] = elt
 		}
 
@@ -471,7 +489,7 @@ func syncProfiles() *Client {
 	}
 	for _, elt := range updates.Profiles {
 		// is it a delete notice?
-		if elt.Length <= 0 {
+		if elt.IsDeleted() {
 			log.Printf("deleting profile: %s", byuuid[elt.UUID])
 			delete(byuuid, elt.UUID)
 		} else {

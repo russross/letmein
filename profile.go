@@ -17,18 +17,22 @@ import (
 const (
 	minMasterLength   = 1
 	maxMasterLength   = 128
-	minURLLength      = 0
-	maxURLLength      = 256
+	minNameLength     = 1
+	maxNameLength     = 256
 	minUsernameLength = 0
 	maxUsernameLength = 256
+	minURLLength      = 0
+	maxURLLength      = 256
 	minLength         = 1
 	maxLength         = 32
 	defaultLength     = 16
 	minGeneration     = 0
-	maxGeneration     = 1 << 50
+	maxGeneration     = 1 << 30
 	defaultGeneration = 0
 	minChar           = 32
 	maxChar           = 126
+
+	schemeScrypt = `scrypt(master\turl\tusername,generation,16384,8,1,length)`
 
 	scryptN = 16384
 	scryptR = 8
@@ -36,6 +40,7 @@ const (
 )
 
 type Profile struct {
+	Scheme      string     `json:"scheme,omitempty"`
 	UUID        string     `json:"uuid"`
 	Name        string     `json:"name,omitempty"`
 	Username    string     `json:"username,omitempty"`
@@ -54,6 +59,9 @@ type Profile struct {
 
 // String gives back a printable summary of a profile.
 func (p *Profile) String() string {
+	if p.Length == 0 {
+		return fmt.Sprintf("[deleted] uuid=%s", p.UUID)
+	}
 	charset := ""
 	if p.Lower {
 		charset += "a–z"
@@ -76,31 +84,65 @@ func (p *Profile) String() string {
 	if p.Exclude != "" {
 		charset += "-[" + p.Exclude + "]"
 	}
-	return fmt.Sprintf("[%s] user:%s gen:%d len:%d chars:%s", p.URL, p.Username, p.Generation, p.Length, charset)
+	modified := ""
+	if p.ModifiedAt != nil {
+		modified = "*"
+	}
+	return fmt.Sprintf("%s[%s] user:%s url:%s gen:%d len:%d chars:%s", modified, p.Name, p.Username, p.URL, p.Generation, p.Length, charset)
 }
 
 // Match returns true if this profile matches the given profile in a search.
-func (p *Profile) Match(q *Profile) bool {
-	if p.Length == 0 {
-		return false
-	}
-	if q.Username != "" && !strings.Contains(p.Username, strings.ToLower(q.Username)) {
-		return false
-	}
-	if q.URL != "" && !strings.Contains(p.URL, strings.ToLower(q.URL)) {
-		return false
-	}
-	if q.Name != "" && !strings.Contains(strings.ToLower(p.Name), strings.ToLower(q.Name)) {
-		return false
-	}
-	return true
+func (p *Profile) Match(search string) bool {
+	return !p.IsDeleted() && strings.Contains(strings.ToLower(p.Name), strings.ToLower(search))
 }
 
 // Validate normalizes some profile parameters and verifies their validity.
 func (p *Profile) Validate() error {
+	// special case: deleted profile
+	if p.IsDeleted() {
+		p.Scheme = ""
+		p.Name = ""
+		p.Username = ""
+		p.URL = ""
+		p.Generation = 0
+		p.Length = 0
+		p.Lower = false
+		p.Upper = false
+		p.Digits = false
+		p.Punctuation = false
+		p.Spaces = false
+		p.Include = ""
+		p.Exclude = ""
+
+		return nil
+	}
+
+	// scheme must be the only recognized scheme
+	if p.Scheme != schemeScrypt {
+		return fmt.Errorf("scheme is not recognized")
+	}
+
+	// trip leading/trailing whitespace from profile name
+	p.Name = strings.TrimSpace(p.Name)
+
+	// name must be within length limits
+	if len(p.Name) < minNameLength || len(p.Name) > maxNameLength {
+		return fmt.Errorf("name must be between %d and %d characters", minNameLength, maxNameLength)
+	}
+
+	// name must not contain illegal characters
+	for _, r := range p.Name {
+		if r < minChar || r > maxChar {
+			return fmt.Errorf("name contains an illegal character")
+		}
+	}
+
+	// convert username to lower case and trim leading/trailing whitespace
+	p.Username = strings.ToLower(strings.TrimSpace(p.Username))
+
 	// username must be within length limits
 	if len(p.Username) < minUsernameLength || len(p.Username) > maxUsernameLength {
-		return fmt.Errorf("username must be between %d and %d characters", minUsernameLength, maxUsernameLength)
+		return fmt.Errorf("username/email must be between %d and %d characters", minUsernameLength, maxUsernameLength)
 	}
 
 	// username must not contain illegal characters
@@ -110,8 +152,8 @@ func (p *Profile) Validate() error {
 		}
 	}
 
-	// convert username to lower case
-	p.Username = strings.ToLower(p.Username)
+	// convert URL to lower case and trim leading/trailing whitespace
+	p.URL = strings.ToLower(strings.TrimSpace(p.URL))
 
 	// URL must be within length limits
 	if len(p.URL) < minURLLength || len(p.URL) > maxURLLength {
@@ -124,9 +166,6 @@ func (p *Profile) Validate() error {
 			return fmt.Errorf("website URL contains an illegal character")
 		}
 	}
-
-	// convert URL to lower case
-	p.URL = strings.ToLower(p.URL)
 
 	// generation must be within limits
 	if p.Generation < minGeneration || p.Generation > maxGeneration {
@@ -162,6 +201,10 @@ func (p *Profile) Validate() error {
 		return fmt.Errorf("profile does not allow > 1 possible character in password")
 	}
 
+	if p.ModifiedAt != nil {
+		*p.ModifiedAt = p.ModifiedAt.Round(time.Millisecond)
+	}
+
 	return nil
 }
 
@@ -194,8 +237,17 @@ func (p *Profile) Generate(master string) string {
 	return out.String()
 }
 
+// IsDeleted returns true if this profile has been deleted.
+func (p *Profile) IsDeleted() bool {
+	return p.Length < 1
+}
+
 // CanUse checks if a given rune can be included in a password based on this profile.
 func (p *Profile) CanUse(r rune) bool {
+	if r < minChar || r > maxChar {
+		return false
+	}
+
 	use := false
 
 	// is this a character the profile calls for?
