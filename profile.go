@@ -40,21 +40,24 @@ const (
 )
 
 type Profile struct {
-	Scheme      string     `json:"scheme,omitempty"`
-	UUID        string     `json:"uuid"`
-	Name        string     `json:"name,omitempty"`
-	Username    string     `json:"username,omitempty"`
-	URL         string     `json:"url,omitempty"`
-	Generation  int        `json:"generation,omitempty"`
-	Length      int        `json:"length,omitempty"`
-	Lower       bool       `json:"lower,omitempty"`
-	Upper       bool       `json:"upper,omitempty"`
-	Digits      bool       `json:"digits,omitempty"`
-	Punctuation bool       `json:"punctuation,omitempty"`
-	Spaces      bool       `json:"spaces,omitempty"`
-	Include     string     `json:"include,omitempty"`
-	Exclude     string     `json:"exclude,omitempty"`
-	ModifiedAt  *time.Time `json:"modified_at,omitempty"`
+	Scheme string `json:"scheme,omitempty"`
+	UUID   string `json:"uuid"`
+
+	Name       string `json:"name,omitempty"`
+	Username   string `json:"username,omitempty"`
+	URL        string `json:"url,omitempty"`
+	Generation int    `json:"generation,omitempty"`
+	Length     int    `json:"length,omitempty"`
+
+	Lower       bool   `json:"lower,omitempty"`
+	Upper       bool   `json:"upper,omitempty"`
+	Digits      bool   `json:"digits,omitempty"`
+	Punctuation bool   `json:"punctuation,omitempty"`
+	Spaces      bool   `json:"spaces,omitempty"`
+	Include     string `json:"include,omitempty"`
+	Exclude     string `json:"exclude,omitempty"`
+
+	ModifiedAt *time.Time `json:"modified_at,omitempty"`
 }
 
 // String gives back a printable summary of a profile.
@@ -119,10 +122,10 @@ func (p *Profile) Validate() error {
 
 	// scheme must be the only recognized scheme
 	if p.Scheme != schemeScrypt {
-		return fmt.Errorf("scheme is not recognized")
+		return fmt.Errorf("unknown scheme: I only recognize %s", schemeScrypt)
 	}
 
-	// trip leading/trailing whitespace from profile name
+	// trim leading/trailing whitespace from profile name
 	p.Name = strings.TrimSpace(p.Name)
 
 	// name must be within length limits
